@@ -18,7 +18,7 @@ $ENV{LD_RUN_PATH} //= "";
 # HAS_BOOL         : stops Perl/lib/CORE/handy.h from doing "#  define bool char" for MSVC
 # NOGDI            : prevents inclusion of wingdi.h which defines functions Polygon() and Polyline() in global namespace
 # BOOST_ASIO_DISABLE_KQUEUE : prevents a Boost ASIO bug on OS X: https://svn.boost.org/trac/boost/ticket/5339
-my @cflags = qw(-DHAS_BOOL -DNOGDI -DSLIC3RXS -DBOOST_ASIO_DISABLE_KQUEUE -Dexprtk_disable_rtl_io_file -Dexprtk_disable_return_statement -Dexprtk_disable_rtl_vecops -Dexprtk_disable_string_capabilities -Dexprtk_disable_enhanced_features);
+my @cflags = qw(-DHAS_BOOL -DNOGDI -DSLIC3RXS -DBOOST_ASIO_DISABLE_KQUEUE -DBOOST_ERROR_CODE_HEADER_ONLY -Dexprtk_disable_rtl_io_file -Dexprtk_disable_return_statement -Dexprtk_disable_rtl_vecops -Dexprtk_disable_string_capabilities -Dexprtk_disable_enhanced_features);
 push @cflags, "-DSLIC3R_BUILD_COMMIT=$ENV{SLIC3R_GIT_VERSION}" if defined $ENV{SLIC3R_GIT_VERSION};
 
 # std=c++11 Enforce usage of C++11 (required now). Minimum compiler supported: gcc 4.9, clang 3.3, MSVC 14.0
@@ -152,7 +152,7 @@ if (defined $ENV{BOOST_LIBRARYPATH}) {
 # In order to generate the -l switches we need to know how Boost libraries are named
 my $have_boost = 0;
 my $have_boost_optional = 0;
-my @boost_libraries = qw(system thread filesystem);  # we need these
+my @boost_libraries = qw(thread filesystem locale chrono atomic date_time regex);  # boost::system is header-only on modern Boost
 my @boost_optional_libraries = qw(nowide);  # we need these, but if they aren't present we can deal
 # check without explicit lib path (works on Linux)
 if (! $mswin) {
@@ -177,11 +177,12 @@ if (!$ENV{SLIC3R_STATIC} && $have_boost) {
     my $lib_prefix = 'libboost_';
     my $lib_ext = $Config{lib_ext};
     PATH: foreach my $path (@boost_libs) {
-        # Try to find the boost system library.
-        my @files = glob "$path/${lib_prefix}system*$lib_ext";
+        # Try to find the first required boost library.
+        my $anchor_lib = $boost_libraries[0];
+        my @files = glob "$path/${lib_prefix}${anchor_lib}*$lib_ext";
         next if !@files;
   
-        if ($files[0] =~ /${lib_prefix}system([^.]*)$lib_ext$/) {
+        if ($files[0] =~ /${lib_prefix}${anchor_lib}([^.]*)$lib_ext$/) {
             # Suffix contains the version number, the build type etc.
             my $suffix = $1;
             # Verify existence of all required boost libraries at $path.
@@ -189,7 +190,7 @@ if (!$ENV{SLIC3R_STATIC} && $have_boost) {
                 # If the library file does not exist, try next library path.
                 -f "$path/$lib" or next PATH;
             }
-            if (! $cpp_guess->is_msvc) {
+            if (! $cpp_guess->is_msvc && ! $mswin) {
                 # Test the correctness of boost libraries by linking them to a minimal C program.
                 check_lib(
                     lib     => [ map "boost_${_}${suffix}", @boost_libraries ],

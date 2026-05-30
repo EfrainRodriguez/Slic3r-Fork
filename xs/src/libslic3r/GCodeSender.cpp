@@ -97,12 +97,12 @@ GCodeSender::connect(std::string devname, unsigned int baud_rate)
     fs.open("serial.txt", std::fstream::out | std::fstream::trunc);
 #endif
     
-    // this gives some work to the io_service before it is started
+    // this gives some work to the io service before it is started
     // (post() runs the supplied function in its thread)
-    this->io.post(boost::bind(&GCodeSender::do_read, this));
+    asio::post(this->io, boost::bind(&GCodeSender::do_read, this));
     
     // start reading in the background thread
-    boost::thread t(boost::bind(&asio::io_service::run, &this->io));
+    boost::thread t(boost::bind(&io_service_t::run, &this->io));
     this->background_thread.swap(t);
     
     // always send a M105 to check for connection because firmware might be silent on connect 
@@ -159,9 +159,9 @@ GCodeSender::disconnect()
     if (!this->open) return;
     this->open = false;
     this->connected = false;
-    this->io.post(boost::bind(&GCodeSender::do_close, this));
+    asio::post(this->io, boost::bind(&GCodeSender::do_close, this));
     this->background_thread.join();
-    this->io.reset();
+    this->io.restart();
     /*
     if (this->error_status()) {
         throw(boost::system::system_error(boost::system::error_code(),
@@ -444,7 +444,7 @@ GCodeSender::send(const std::string &line, bool priority)
 void
 GCodeSender::send()
 {
-    this->io.post(boost::bind(&GCodeSender::do_send, this));
+    asio::post(this->io, boost::bind(&GCodeSender::do_send, this));
 }
 
 void
@@ -529,7 +529,7 @@ void
 GCodeSender::set_DTR(bool on)
 {
 #if defined(_WIN32) && !defined(__SYMBIAN32__)
-    asio::serial_port_service::native_handle_type handle = this->serial.native_handle();
+    asio::serial_port::native_handle_type handle = this->serial.native_handle();
     if (on)
         EscapeCommFunction(handle, SETDTR);
     else

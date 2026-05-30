@@ -7,6 +7,8 @@ use warnings;
 use File::Basename qw(basename fileparse);
 use File::Spec;
 use List::Util qw(min max first sum);
+use JSON::PP;
+use Scalar::Util qw(blessed);
 use Slic3r::ExtrusionLoop ':roles';
 use Slic3r::ExtrusionPath ':roles';
 use Slic3r::Flow ':roles';
@@ -159,6 +161,447 @@ sub export_gcode {
             system($executable, @parsed_script);
         }
     }
+}
+
+sub export_toolpaths_json {
+    my $self = shift;
+    my %params = @_;
+
+    $self->process;
+
+    my $output_file = $self->output_filepath($params{output_file} // '');
+    $output_file =~ s/\.gcode$/.json/i;
+    $self->status_cb->(90, "Exporting toolpaths JSON" . ($output_file ? " to $output_file" : ""));
+
+    my $estimated_stats = $self->_estimate_material_usage_via_gcode();
+
+    my $encoder = JSON::PP->new->canonical->utf8;
+    $encoder = $encoder->pretty if $params{pretty} // 1;
+    my $json = $encoder->encode($self->toolpaths_as_json_data(estimated_stats => $estimated_stats));
+
+    my ($fh, $tempfile);
+    if ($params{output_fh}) {
+        $fh = $params{output_fh};
+        print {$fh} $json;
+        close $fh;
+        return;
+    }
+
+    $tempfile = "$output_file.tmp";
+    Slic3r::open(\$fh, ">", $tempfile)
+        or die "Failed to open $tempfile for writing\n";
+    binmode $fh, ':utf8';
+    print {$fh} $json;
+    close $fh;
+
+    my $renamed = 0;
+    for my $i (1..5) {
+        last if $renamed = rename Slic3r::encode_path($tempfile), Slic3r::encode_path($output_file);
+        select(undef, undef, undef, 0.25);
+    }
+    Slic3r::debugf "Failed to rename the output JSON file from $tempfile to $output_file. Is $tempfile locked?\n"
+        if !$renamed;
+}
+
+sub toolpaths_as_json_data {
+    my ($self, %params) = @_;
+    my $estimated_stats = $params{estimated_stats} // {};
+
+    my @objects_data = ();
+    my @layers_data = ();
+    my $layer_seq_id = 0;
+
+    for my $obj_idx (0 .. $#{$self->objects}) {
+        my $object = $self->objects->[$obj_idx];
+
+        push @objects_data, {
+            object_index    => $obj_idx,
+            object_id       => _safe_call($object, 'id') // _safe_call($object, 'ptr') // $obj_idx,
+            copies          => [ map { [ map unscale($_), @$_ ] } @{$object->_shifted_copies} ],
+            config          => _config_to_hash($object->config),
+            raft_layers     => $object->config->raft_layers,
+        };
+
+        my @layers = sort { $a->print_z <=> $b->print_z } (@{$object->layers}, @{$object->support_layers});
+        for my $layer (@layers) {
+            my $is_support = $layer->isa('Slic3r::Layer::Support') ? JSON::PP::true : JSON::PP::false;
+            my $is_raft = ($layer->id < $object->config->raft_layers) ? JSON::PP::true : JSON::PP::false;
+
+            my $layer_data = {
+                layer_seq_id     => $layer_seq_id++,
+                object_index     => $obj_idx,
+                layer_id         => $layer->id,
+                print_z          => $layer->print_z + 0,
+                slice_z          => ($layer->slice_z >= 0 ? $layer->slice_z + 0 : undef),
+                height           => $layer->height + 0,
+                is_support_layer => $is_support,
+                is_raft_layer    => $is_raft,
+                process          => {
+                    layer_height            => $layer->height + 0,
+                    print_speed_perimeter   => _safe_config_num($object->config, 'perimeter_speed'),
+                    print_speed_infill      => _safe_config_num($object->config, 'infill_speed'),
+                    print_speed_solid       => _safe_config_num($object->config, 'solid_infill_speed'),
+                    print_speed_top_solid   => _safe_config_num($object->config, 'top_solid_infill_speed'),
+                    support_speed           => _safe_config_num($object->config, 'support_material_speed'),
+                    support_interface_speed => _safe_config_num($object->config, 'support_material_interface_speed'),
+                },
+                regions => [],
+                support => {
+                    interface_paths => [],
+                    support_paths   => [],
+                },
+                events => [],
+            };
+
+            for my $region_id (0 .. ($self->region_count - 1)) {
+                my $layerm = $layer->regions->[$region_id] or next;
+                my $region = $self->get_region($region_id);
+                my $region_data = {
+                    region_id => $region_id,
+                    config    => _config_to_hash($region->config),
+                    perimeters => [],
+                    infill_groups => [],
+                };
+
+                for my $perimeter_coll (@{$layerm->perimeters}) {
+                    _collect_entities($perimeter_coll, $region_data->{perimeters}, {
+                        source => 'perimeter',
+                        region_id => $region_id,
+                        layer_print_z => $layer->print_z + 0,
+                        is_raft_layer => $is_raft,
+                    });
+                }
+
+                for my $fill_coll (@{$layerm->fills}) {
+                    my @group = ();
+                    _collect_entities($fill_coll, \@group, {
+                        source => 'infill',
+                        region_id => $region_id,
+                        layer_print_z => $layer->print_z + 0,
+                        is_raft_layer => $is_raft,
+                    });
+                    push @{$region_data->{infill_groups}}, \@group if @group;
+                }
+
+                push @{$layer_data->{regions}}, $region_data;
+            }
+
+            if ($is_support) {
+                _collect_entities($layer->support_interface_fills, $layer_data->{support}{interface_paths}, {
+                    source => 'support_interface',
+                    region_id => undef,
+                    layer_print_z => $layer->print_z + 0,
+                    is_raft_layer => $is_raft,
+                });
+                _collect_entities($layer->support_fills, $layer_data->{support}{support_paths}, {
+                    source => 'support',
+                    region_id => undef,
+                    layer_print_z => $layer->print_z + 0,
+                    is_raft_layer => $is_raft,
+                });
+            }
+
+            _build_layer_events_with_travels($layer_data);
+
+            push @layers_data, $layer_data;
+        }
+    }
+
+    return {
+        schema_version => '1.0.0',
+        generator => {
+            name    => 'Slic3r',
+            version => $Slic3r::VERSION,
+        },
+        summary => {
+            object_count       => scalar(@{$self->objects}),
+            region_count       => $self->region_count,
+            total_layer_count  => $self->total_layer_count,
+            has_support        => $self->has_support_material ? JSON::PP::true : JSON::PP::false,
+            used_filament_mm   => ($estimated_stats->{used_filament_mm} // ($self->total_used_filament + 0)),
+            used_volume_mm3    => ($estimated_stats->{used_volume_mm3} // ($self->total_extruded_volume + 0)),
+        },
+        print_config => _config_to_hash($self->config),
+        print_level_toolpaths => {
+            skirt => do {
+                my @items = ();
+                _collect_entities($_, \@items, { source => 'skirt', region_id => undef, layer_print_z => undef }) for @{$self->skirt};
+                \@items;
+            },
+            brim  => do {
+                my @items = ();
+                _collect_entities($_, \@items, { source => 'brim', region_id => undef, layer_print_z => undef }) for @{$self->brim};
+                \@items;
+            },
+        },
+        objects => \@objects_data,
+        layers  => \@layers_data,
+    };
+}
+
+sub _build_layer_events_with_travels {
+    my ($layer_data) = @_;
+
+    my @events = ();
+
+    for my $region (@{$layer_data->{regions} // []}) {
+        _flatten_paths($region->{perimeters}, \@events);
+        for my $group (@{$region->{infill_groups} // []}) {
+            _flatten_paths($group, \@events);
+        }
+    }
+
+    _flatten_paths($layer_data->{support}{interface_paths}, \@events);
+    _flatten_paths($layer_data->{support}{support_paths}, \@events);
+
+    my @with_travel = ();
+    my $prev_end;
+    for my $ev (@events) {
+        my $start = _path_start_point($ev);
+        my $end   = _path_end_point($ev);
+        if ($prev_end && $start) {
+            my ($x1, $y1, $z1) = @$prev_end;
+            my ($x2, $y2, $z2) = @$start;
+            if (defined $x1 && defined $x2 && ($x1 != $x2 || $y1 != $y2 || $z1 != $z2)) {
+                push @with_travel, {
+                    type            => 'travel',
+                    feature_type    => 'travel',
+                    source          => 'travel',
+                    region_id       => undef,
+                    layer_print_z   => $z1,
+                    role_id         => undef,
+                    role_name       => 'travel',
+                    is_bridge       => JSON::PP::false,
+                    is_solid_infill => JSON::PP::false,
+                    width           => 0,
+                    height          => 0,
+                    mm3_per_mm      => 0,
+                    point_count     => 2,
+                    points          => [ [ $x1, $y1, $z1 ], [ $x2, $y2, $z2 ] ],
+                };
+            }
+        }
+        push @with_travel, $ev;
+        $prev_end = $end if $end;
+    }
+
+    $layer_data->{events} = \@with_travel;
+}
+
+sub _flatten_paths {
+    my ($node, $out) = @_;
+    return if !defined $node;
+    if (ref($node) eq 'ARRAY') {
+        _flatten_paths($_, $out) for @$node;
+        return;
+    }
+    if (ref($node) eq 'HASH') {
+        if (($node->{type} // '') eq 'extrusion_path') {
+            push @$out, $node;
+            return;
+        }
+        if (exists $node->{paths}) {
+            _flatten_paths($_, $out) for @{$node->{paths} // []};
+            return;
+        }
+    }
+}
+
+sub _path_start_point {
+    my ($ev) = @_;
+    return undef if !defined($ev) || ref($ev) ne 'HASH';
+    return undef if !exists $ev->{points} || ref($ev->{points}) ne 'ARRAY' || !@{$ev->{points}};
+    my $p = $ev->{points}[0];
+    return undef if ref($p) ne 'ARRAY' || @$p < 2;
+    return [ $p->[0] + 0, $p->[1] + 0, ($p->[2] // ($ev->{layer_print_z} // 0)) + 0 ];
+}
+
+sub _path_end_point {
+    my ($ev) = @_;
+    return undef if !defined($ev) || ref($ev) ne 'HASH';
+    return undef if !exists $ev->{points} || ref($ev->{points}) ne 'ARRAY' || !@{$ev->{points}};
+    my $p = $ev->{points}[-1];
+    return undef if ref($p) ne 'ARRAY' || @$p < 2;
+    return [ $p->[0] + 0, $p->[1] + 0, ($p->[2] // ($ev->{layer_print_z} // 0)) + 0 ];
+}
+
+sub _estimate_material_usage_via_gcode {
+    my ($self) = @_;
+
+    my $tmp_gcode = '';
+    my $ok = eval {
+        open my $fh, '>', \$tmp_gcode or die "Failed to open in-memory filehandle for estimation\n";
+        Slic3r::Print::GCode->new(
+            print => $self,
+            fh    => $fh,
+        )->export;
+        close $fh;
+        1;
+    };
+
+    if (!$ok) {
+        warn "Warning: failed to estimate material usage for JSON export: $@\n";
+        return {};
+    }
+
+    return {
+        used_filament_mm => $self->total_used_filament + 0,
+        used_volume_mm3  => $self->total_extruded_volume + 0,
+    };
+}
+
+sub _collect_entities {
+    my ($entity, $out, $meta) = @_;
+    return if !defined $entity;
+
+    if (blessed($entity) && $entity->isa('Slic3r::ExtrusionPath')) {
+        push @$out, _serialize_entity($entity, $meta);
+        return;
+    }
+
+    if (blessed($entity) && $entity->isa('Slic3r::ExtrusionPath::Collection')) {
+        _collect_entities($_, $out, $meta) for @$entity;
+        return;
+    }
+
+    if (blessed($entity) && $entity->isa('Slic3r::ExtrusionLoop')) {
+        push @$out, _serialize_entity($entity, $meta);
+        return;
+    }
+
+    if (ref($entity) eq 'ARRAY') {
+        _collect_entities($_, $out, $meta) for @$entity;
+        return;
+    }
+}
+
+sub _serialize_entity {
+    my ($entity, $meta) = @_;
+    if (blessed($entity) && $entity->isa('Slic3r::ExtrusionLoop')) {
+        my @children = map { _serialize_entity($_, $meta) } @$entity;
+        return {
+            source        => $meta->{source},
+            region_id     => $meta->{region_id},
+            layer_print_z => $meta->{layer_print_z},
+            type          => 'extrusion_loop',
+            feature_type  => _feature_type($meta->{source}, 'loop', undef, $meta->{is_raft_layer}),
+            role_id       => _safe_call($entity, 'role'),
+            role_name     => 'loop',
+            path_count    => scalar(@children),
+            paths         => \@children,
+        };
+    }
+
+    if (ref($entity) eq 'ARRAY' && (!blessed($entity) || !$entity->isa('Slic3r::ExtrusionPath::Collection'))) {
+        my @children = map { _serialize_entity($_, $meta) } @$entity;
+        return {
+            source        => $meta->{source},
+            region_id     => $meta->{region_id},
+            layer_print_z => $meta->{layer_print_z},
+            type          => 'path_group',
+            feature_type  => _feature_type($meta->{source}, 'group', undef, $meta->{is_raft_layer}),
+            path_count    => scalar(@children),
+            paths         => \@children,
+        };
+    }
+
+    my $polyline = $entity->polyline;
+    my @points = map { [ map unscale($_), @$_ ] } @$polyline;
+    my $role_name = _role_name(_safe_call($entity, 'role'));
+
+    return {
+        source          => $meta->{source},
+        region_id       => $meta->{region_id},
+        layer_print_z   => $meta->{layer_print_z},
+        type            => 'extrusion_path',
+        role_id         => _safe_call($entity, 'role'),
+        role_name       => $role_name,
+        feature_type    => _feature_type($meta->{source}, $role_name, _safe_call($entity, 'is_bridge'), $meta->{is_raft_layer}),
+        is_bridge       => _bool(_safe_call($entity, 'is_bridge')),
+        is_solid_infill => _bool(_safe_call($entity, 'is_solid_infill')),
+        width           => _safe_num($entity, 'width'),
+        height          => _safe_num($entity, 'height'),
+        mm3_per_mm      => _safe_num($entity, 'mm3_per_mm'),
+        point_count     => scalar(@points),
+        points          => \@points,
+    };
+}
+
+sub _feature_type {
+    my ($source, $role_name, $is_bridge, $is_raft_layer) = @_;
+    return 'skirt' if defined($source) && $source eq 'skirt';
+    return 'brim' if defined($source) && $source eq 'brim';
+    return 'support_interface' if defined($source) && $source eq 'support_interface';
+    return ($is_raft_layer ? 'raft_support' : 'support') if defined($source) && $source eq 'support';
+    return 'bridge' if $is_bridge;
+
+    return 'perimeter_external' if defined($role_name) && $role_name eq 'external_perimeter';
+    return 'perimeter_overhang' if defined($role_name) && $role_name eq 'overhang_perimeter';
+    return 'perimeter_internal' if defined($role_name) && $role_name eq 'perimeter';
+    return 'infill_top_solid' if defined($role_name) && $role_name eq 'top_solid_fill';
+    return 'infill_solid' if defined($role_name) && $role_name eq 'solid_fill';
+    return 'infill' if defined($role_name) && $role_name eq 'fill';
+    return 'gap_fill' if defined($role_name) && $role_name eq 'gap_fill';
+    return ($is_raft_layer ? 'raft' : 'infill') if defined($source) && $source eq 'infill';
+    return 'unknown';
+}
+
+sub _safe_call {
+    my ($obj, $method) = @_;
+    return undef if !defined($obj) || !blessed($obj) || !$obj->can($method);
+    my $v = eval { $obj->$method };
+    return $@ ? undef : $v;
+}
+
+sub _safe_num {
+    my ($obj, $method) = @_;
+    my $v = _safe_call($obj, $method);
+    return undef if !defined $v;
+    return $v + 0;
+}
+
+sub _bool {
+    my ($v) = @_;
+    return undef if !defined $v;
+    return $v ? JSON::PP::true : JSON::PP::false;
+}
+
+sub _config_to_hash {
+    my ($config) = @_;
+    my %out = ();
+    for my $opt_key (@{$config->get_keys}) {
+        my $serialized = eval { $config->serialize($opt_key) };
+        next if $@;
+        $out{$opt_key} = $serialized;
+    }
+    return \%out;
+}
+
+sub _safe_config_num {
+    my ($config, $key) = @_;
+    my $v = eval { $config->$key };
+    return undef if $@ || !defined $v;
+    return $v;
+}
+
+sub _role_name {
+    my ($role_id) = @_;
+    return undef if !defined $role_id;
+    my %map = (
+        EXTR_ROLE_NONE()                      => 'none',
+        EXTR_ROLE_PERIMETER()                 => 'perimeter',
+        EXTR_ROLE_EXTERNAL_PERIMETER()        => 'external_perimeter',
+        EXTR_ROLE_OVERHANG_PERIMETER()        => 'overhang_perimeter',
+        EXTR_ROLE_FILL()                      => 'fill',
+        EXTR_ROLE_SOLIDFILL()                 => 'solid_fill',
+        EXTR_ROLE_TOPSOLIDFILL()              => 'top_solid_fill',
+        EXTR_ROLE_GAPFILL()                   => 'gap_fill',
+        EXTR_ROLE_BRIDGE()                    => 'bridge',
+        EXTR_ROLE_SKIRT()                     => 'skirt',
+        EXTR_ROLE_SUPPORTMATERIAL()           => 'support_material',
+        EXTR_ROLE_SUPPORTMATERIAL_INTERFACE() => 'support_material_interface',
+    );
+    return $map{$role_id};
 }
 
 # Export SVG slices for the offline SLA printing.

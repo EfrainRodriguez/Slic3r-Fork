@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Slic3r Toolpath Viewer</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app">
+    <aside class="panel">
+      <h1>Toolpath Viewer</h1>
+      <p class="muted">Fast preview for <code>Lupin_v1.gcode</code></p>
+
+      <div class="group">
+        <label class="file-label">
+          <input id="fileInput" type="file" accept=".gcode,.txt,.json" />
+          Load file (.gcode/.json)
+        </label>
+      </div>
+
+      <div class="group stats">
+        <div><strong>Source:</strong> <span id="sourceType">-</span></div>
+      </div>
+
+      <div class="group">
+        <label for="viewMode">View mode</label>
+        <select id="viewMode">
+          <option value="3d">3D</option>
+          <option value="2d">2D</option>
+        </select>
+      </div>
+
+      <div class="group">
+        <label for="layerMode">Layer display</label>
+        <select id="layerMode">
+          <option value="all">All layers</option>
+          <option value="single">Single layer</option>
+        </select>
+      </div>
+
+      <div class="group">
+        <label for="layerSlider">Layer: <span id="layerLabel">-</span></label>
+        <input id="layerSlider" type="range" min="0" max="0" step="1" value="0" disabled />
+      </div>
+
+      <div class="group stats">
+        <div><strong>Layers:</strong> <span id="layersCount">-</span></div>
+        <div><strong>Segments:</strong> <span id="segmentsCount">-</span></div>
+        <div><strong>Bounds:</strong> <span id="boundsText">-</span></div>
+      </div>
+
+      <div class="group">
+        <label>Layer process params</label>
+        <pre id="processParams" class="process-params">Load data...</pre>
+      </div>
+
+      <p class="hint">Mouse: drag = orbit/pan, wheel = zoom. In 2D, use top view + orthographic camera.</p>
+      <p class="status" id="status">Ready.</p>
+    </aside>
+
+    <main class="viewport-wrap">
+      <canvas id="viewport"></canvas>
+    </main>
+  </div>
+
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

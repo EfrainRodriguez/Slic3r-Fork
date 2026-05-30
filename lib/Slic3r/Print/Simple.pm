@@ -169,4 +169,12 @@ sub export_svg {
     $self->_after_export;
 }
 
+sub export_toolpaths_json {
+    my ($self) = @_;
+
+    $self->_before_export;
+    $self->_print->export_toolpaths_json(output_file => $self->output_file);
+    $self->_after_export;
+}
+
 1;
